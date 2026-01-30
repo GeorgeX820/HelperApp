@@ -3,8 +3,6 @@ using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
-using Azure.Storage.Blobs;
-using Azure.Storage.Blobs.Models;
 
 namespace HelperApp;
 
@@ -130,24 +128,23 @@ public class BuildHelper
                 Log($"✓ Updated: {Path.GetFileName(csproj)}");
 
                 // Update version.xml if exists
-                var versionXmlPath = Path.Combine(ProjectPath, "AzureSetup", "version.xml");
+                var versionXmlPath = Path.Combine(ProjectPath, "Data", "version.xml");
                 if (File.Exists(versionXmlPath))
                 {
                     var xmlContent = File.ReadAllText(versionXmlPath);
                     xmlContent = Regex.Replace(xmlContent, @"<version>[^<]*</version>", $"<version>{newVersion}</version>");
                     
-                    // Update ZIP filename in URL
-                    var projectName = Path.GetFileNameWithoutExtension(csproj);
+                    // Update ZIP filename in URL (ShivaBookings_v{version}.zip format)
                     xmlContent = Regex.Replace(xmlContent, 
-                        $@"{projectName}-v[\d\.]+\.zip", 
-                        $"{projectName}-v{newVersion}.zip");
+                        @"ShivaBookings_v[\d\.]+\.zip", 
+                        $"ShivaBookings_v{newVersion}.zip");
                     
                     File.WriteAllText(versionXmlPath, xmlContent);
                     Log($"✓ Updated: version.xml");
                 }
 
                 // Update changelog.html if exists
-                var changelogPath = Path.Combine(ProjectPath, "AzureSetup", "changelog.html");
+                var changelogPath = Path.Combine(ProjectPath, "Data", "changelog.html");
                 if (File.Exists(changelogPath))
                 {
                     var changelogContent = File.ReadAllText(changelogPath);
@@ -203,7 +200,7 @@ public class BuildHelper
     private void CleanPublishFolder()
     {
         Log("🧹 Cleaning old publish files...");
-        var publishPath = Path.Combine(ProjectPath, "bin", "Release", "net8.0-windows", "publish");
+        var publishPath = Path.Combine(ProjectPath, "bin", "Release", "net9.0-windows", "publish");
         CleanFolder(publishPath, "publish folder");
     }
 
@@ -246,7 +243,7 @@ public class BuildHelper
     {
         await Task.Run(() => CleanPublishFolder());
         // Output to bin\Release\net8.0-windows\publish\win-x64 (matches VS profile)
-        var publishOutputPath = Path.Combine(ProjectPath, "bin", "Release", "net8.0-windows", "publish", "win-x64");
+        var publishOutputPath = Path.Combine(ProjectPath, "bin", "Release", "net9.0-windows", "publish", "win-x64");
         var args = $"publish -c Release -r win-x64 --self-contained false -o \"{publishOutputPath}\" -p:Version={Version} -p:AssemblyVersion={Version} -p:FileVersion={Version}";
         return await RunDotnetCommandAsync(args, "Publishing");
     }
@@ -325,7 +322,7 @@ public class BuildHelper
                 }
 
                 var projectName = Path.GetFileNameWithoutExtension(csproj);
-                var publishPath = Path.Combine(ProjectPath, "bin", "Release", "net8.0-windows", "publish", "win-x64");
+                var publishPath = Path.Combine(ProjectPath, "bin", "Release", "net9.0-windows", "publish", "win-x64");
 
                 if (!Directory.Exists(publishPath))
                 {
@@ -340,8 +337,8 @@ public class BuildHelper
                 if (!Directory.Exists(OutputPath))
                     Directory.CreateDirectory(OutputPath);
 
-                // ZIP filename
-                var zipFileName = $"{projectName}-v{Version}.zip";
+                // ZIP filename (ShivaBookings_v{version}.zip format)
+                var zipFileName = $"ShivaBookings_v{Version}.zip";
                 var zipPath = Path.Combine(OutputPath, zipFileName);
 
                 // Delete existing ZIP if exists
@@ -374,14 +371,14 @@ public class BuildHelper
                     Log($"📂 Location: {zipPath}");
 
                     // Also copy version.xml and changelog.html to output folder (for Azure upload)
-                    var versionXmlSrc = Path.Combine(ProjectPath, "AzureSetup", "version.xml");
+                    var versionXmlSrc = Path.Combine(ProjectPath, "Data", "version.xml");
                     if (File.Exists(versionXmlSrc))
                     {
                         File.Copy(versionXmlSrc, Path.Combine(OutputPath, "version.xml"), true);
                         Log("✓ Copied version.xml to output folder");
                     }
 
-                    var changelogSrc = Path.Combine(ProjectPath, "AzureSetup", "changelog.html");
+                    var changelogSrc = Path.Combine(ProjectPath, "Data", "changelog.html");
                     if (File.Exists(changelogSrc))
                     {
                         File.Copy(changelogSrc, Path.Combine(OutputPath, "changelog.html"), true);
@@ -417,15 +414,8 @@ public class BuildHelper
         if (!await PublishAsync()) return false;
         if (!await CreateDeployPackageAsync()) return false;
         
-        // Upload to Azure if configured
-        if (!string.IsNullOrEmpty(AzureSasUrl))
-        {
-            if (!await UploadToAzureAsync()) return false;
-        }
-        else
-        {
-            Log("⚠️ Azure SAS URL not configured - skipping upload");
-        }
+        // Upload to Azure using CLI
+        if (!await UploadToAzureAsync()) return false;
 
         Log("═══════════════════════════════════════");
         Log("🎉 Full deploy completed successfully!");
@@ -433,43 +423,48 @@ public class BuildHelper
         return true;
     }
 
+    // Azure Storage settings for ShivaBookings
+    private const string AzureStorageAccount = "updatestoragefastx";
+    private const string AzureContainer = "containerfastx";
+
     public async Task<bool> UploadToAzureAsync()
     {
-        return await Task.Run(async () =>
+        return await Task.Run(() =>
         {
             try
             {
                 Log("☁️ Uploading to Azure Blob Storage...");
-                
-                if (string.IsNullOrEmpty(AzureSasUrl))
+                Log($"   Account: {AzureStorageAccount}");
+                Log($"   Container: {AzureContainer}");
+
+                // Get account key using Azure CLI
+                Log("🔑 Getting Azure account key...");
+                var keyResult = RunAzCommand($"storage account keys list --account-name {AzureStorageAccount} --query \"[0].value\" --output tsv");
+                if (string.IsNullOrEmpty(keyResult))
                 {
-                    Log("❌ Azure SAS URL not configured!");
+                    Log("❌ Failed to get Azure account key! Make sure you're logged in with 'az login'");
                     return false;
                 }
+                var accountKey = keyResult.Trim();
+                Log("✓ Got account key");
 
-                var containerClient = new BlobContainerClient(new Uri(AzureSasUrl));
-                
-                // Delete old blobs first
-                Log("🗑️ Deleting old files from Azure...");
-                await foreach (var blobItem in containerClient.GetBlobsAsync())
-                {
-                    var blobClient = containerClient.GetBlobClient(blobItem.Name);
-                    await blobClient.DeleteIfExistsAsync();
-                    Log($"   Deleted: {blobItem.Name}");
-                }
-
-                // Upload new files from output folder
-                Log("📤 Uploading new files...");
+                // Upload files from output folder
                 if (Directory.Exists(OutputPath))
                 {
                     foreach (var file in Directory.GetFiles(OutputPath))
                     {
                         var fileName = Path.GetFileName(file);
-                        var blobClient = containerClient.GetBlobClient(fileName);
                         
-                        using var stream = File.OpenRead(file);
-                        await blobClient.UploadAsync(stream, overwrite: true);
-                        Log($"   ✅ Uploaded: {fileName}");
+                        // Upload version.xml as ver_new.xml (to bypass cache)
+                        var blobName = fileName == "version.xml" ? "ver_new.xml" : fileName;
+                        
+                        Log($"📤 Uploading: {fileName} → {blobName}");
+                        var uploadResult = RunAzCommand($"storage blob upload --account-name {AzureStorageAccount} --account-key \"{accountKey}\" --container-name {AzureContainer} --name \"{blobName}\" --file \"{file}\" --overwrite --content-type \"{GetContentType(fileName)}\"");
+                        
+                        if (uploadResult != null)
+                            Log($"   ✅ Uploaded: {blobName}");
+                        else
+                            Log($"   ⚠️ Upload may have failed: {blobName}");
                     }
                 }
 
@@ -482,6 +477,59 @@ public class BuildHelper
                 return false;
             }
         });
+    }
+
+    private string GetContentType(string fileName)
+    {
+        var ext = Path.GetExtension(fileName).ToLower();
+        return ext switch
+        {
+            ".xml" => "application/xml",
+            ".html" => "text/html",
+            ".zip" => "application/zip",
+            ".json" => "application/json",
+            _ => "application/octet-stream"
+        };
+    }
+
+    private string? RunAzCommand(string arguments)
+    {
+        try
+        {
+            // Use full path to az.cmd
+            var azPath = @"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd";
+            
+            var psi = new ProcessStartInfo
+            {
+                FileName = azPath,
+                Arguments = arguments,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi);
+            if (process == null) return null;
+
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode == 0)
+                return output;
+            
+            // Log error for debugging
+            if (!string.IsNullOrEmpty(error))
+                Log($"   Az error: {error.Trim()}");
+            
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Log($"   Az exception: {ex.Message}");
+            return null;
+        }
     }
 
     private void CopyDirectory(string sourceDir, string destDir)
